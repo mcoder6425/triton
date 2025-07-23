@@ -17,7 +17,7 @@ The [official documentation](https://triton-lang.org) contains installation inst
 # Quick Installation
 
 
-<div align="center"> triton for gfx906
+triton for gfx906
 ===================
 
 This is a modified version of triton, works with AMD gfx906
