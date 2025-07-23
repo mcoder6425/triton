@@ -1,4 +1,4 @@
-triton for gfx906
+<div align="center"> triton for gfx906
 ===================
 
 This is a modified version of triton, works with AMD gfx906
@@ -17,7 +17,7 @@ pip3 install 'torch==2.7' torchvision torchaudio --index-url https://download.py
 pip3 install ninja 'cmake<4' wheel pybind11
 
 pip3 install python/
-
+</div>
 
 
 
