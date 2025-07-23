@@ -1,27 +1,3 @@
-<div align="center"> triton for gfx906
-===================
-
-This is a modified version of triton, works with AMD gfx906
-GPUs such as Radeon VII / Radeon Pro VII / Instinct MI50 / Instinct MI60.
-
-INSTALL
--------------------
-
-```
-cd triton-gfx906
-
-python3 -m venv tritonenv
-source tritonenv/bin/activate
-
-pip3 install 'torch==2.7' torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3
-pip3 install ninja 'cmake<4' wheel pybind11
-
-pip3 install python/
-</div>
-
-
-
-
 <div align="center">
   <img src="https://lh5.googleusercontent.com/wzQKEsTFkrgNQO9JjhGH5wFvslJr1saLtLaJ_a6Fp_gNENpvt3VG7BmztwngU9hFJaU4CPwGiw1opQtDvTkLrxWRbO_a12Q-pdESWHgtmheIHcPbOL5ZMC4TSiJVe5ty1w=w3517" alt="Triton logo">
 </div>
@@ -39,6 +15,31 @@ The foundations of this project are described in the following MAPL2019 publicat
 The [official documentation](https://triton-lang.org) contains installation instructions and tutorials.  See also these third-party [Triton puzzles](https://github.com/srush/Triton-Puzzles), which can all be run using the Triton interpreter -- no GPU required.
 
 # Quick Installation
+
+
+<div align="center"> triton for gfx906
+===================
+
+This is a modified version of triton, works with AMD gfx906
+GPUs such as Radeon VII / Radeon Pro VII / Instinct MI50 / Instinct MI60.
+
+INSTALL
+-------------------
+
+```shell
+cd triton-gfx906
+
+python3 -m venv tritonenv
+source tritonenv/bin/activate
+
+pip3 install 'torch==2.7' torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3
+pip3 install ninja 'cmake<4' wheel pybind11
+
+pip3 install python/
+```
+
+
+
 
 You can install the latest stable release of Triton from pip:
 
