@@ -10,7 +10,7 @@ from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
 from triton_kernels.matmul_ogs import matmul_ogs, PrecisionConfig, FlexCtx, FnSpecs, FusedActivation
 from triton_kernels.numerics import InFlexData
 from triton_kernels.routing import routing
-from triton_kernels.target_info import is_hip, get_cdna_version
+from triton_kernels.target_info import is_cuda, is_hip, get_cdna_version, cuda_capability_geq
 from triton_kernels.tensor import convert_layout
 from triton_kernels.tensor import wrap_torch_tensor, FP4
 from dataclasses import dataclass
@@ -32,6 +32,8 @@ def quantize(w, dtype, **opt):
         fp8e4_dtype = torch.float8_e4m3fn if get_cdna_version() != 3 \
             else torch.float8_e4m3fnuz
         wq = w.to(fp8e4_dtype)
+        if is_cuda() and not cuda_capability_geq(10, 0):
+            wq = wq.transpose(-1, -2).contiguous().transpose(-1, -2)
         return wq, InFlexData(dtype=wq.dtype, scale=w.abs().max().unsqueeze(0)), None
     else:
         assert dtype == "mx4", f"{dtype=}"
@@ -186,7 +188,16 @@ def roofline_mlp(batch_ranges, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_
     ax.set_ylim(100, max_tflops + 500)
     # plot roofline
     opints = [p.opint for p in perfs]
-    knee = bisect_left(opints, max_tflops / max_tbps) - 1
+    knee = bisect_left(opints, max_tflops / max_tbps)
+    if knee > 0:  # has a bandwidth-bound knee
+        x_bw = [xs[0], xs[knee - 1]]
+        y_bw = [opints[0] * max_tbps, max_tflops]
+    else:  # no knee found, compute-bound only
+        x_bw = y_bw = []
+    x_comp = xs[knee:]
+    y_comp = [max_tflops] * len(x_comp)
+    ax.plot(x_bw, y_bw, "--", label=f"BW-bound  ({max_tbps:.1f} TB/s)", color="blue")
+    ax.plot(x_comp, y_comp, "--", label=f"Compute-bound  ({max_tflops:.0f} TFLOP/s)", color="orange")
     x_bw, x_comp = xs[:knee], xs[knee:]
     x_bw = [x_bw[0], x_comp[0]]
     y_bw = [opints[0] * max_tbps, max_tflops]
