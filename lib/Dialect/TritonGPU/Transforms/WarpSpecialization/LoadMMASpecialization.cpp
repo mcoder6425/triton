@@ -85,15 +85,6 @@ getPartitionScheme(scf::ForOp loop, const WarpSchedule &schedule) {
 // Utilities
 //===----------------------------------------------------------------------===//
 
-static void replaceAllUsesDominatedBy(Operation *domOp, Value newValue,
-                                      Value oldValue, DominanceInfo &domInfo) {
-  if (newValue == oldValue)
-    return;
-  oldValue.replaceUsesWithIf(newValue, [&](OpOperand &use) {
-    return domInfo.properlyDominates(domOp, use.getOwner());
-  });
-}
-
 static std::pair<Value, Value> postIncrementModulo(ImplicitLocOpBuilder &b,
                                                    Value index, Value phase,
                                                    unsigned numStages) {
@@ -820,7 +811,16 @@ static LogicalResult pipelineMMA(scf::ForOp &loop, PipelinedMMA &mma,
     Value lastIndex = loop.getResult(index.getArgNumber() - 1);
     Value lastPhase = loop.getResult(phase.getArgNumber() - 1);
     Value lastBar = createSingleBufferView(b, nodes.back().barNext, lastIndex);
-    b.create<ttng::WaitBarrierOp>(lastBar, lastPhase);
+    auto waitBarrierOp = b.create<ttng::WaitBarrierOp>(lastBar, lastPhase);
+    auto node_front = nodes.front();
+    auto partition = schedule.getPartition(inBody(node_front.op));
+    PartitionBuilder b(waitBarrierOp->getLoc(), waitBarrierOp);
+    lastBar.getDefiningOp()->setAttr(kWarpSpecializeTagAttrName,
+                                     b.getI32IntegerAttr(schedule.getTag()));
+    waitBarrierOp->setAttr(kWarpSpecializeTagAttrName,
+                           b.getI32IntegerAttr(schedule.getTag()));
+    b.assignPartition(lastBar.getDefiningOp(), *partition);
+    b.assignPartition(waitBarrierOp, *partition);
   }
 
   llvm::SetVector<Operation *> predOps;

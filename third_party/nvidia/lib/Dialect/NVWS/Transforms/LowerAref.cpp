@@ -21,6 +21,7 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AttrTypeSubElements.h"
@@ -109,8 +110,6 @@ BarrierCount getArrivalCount(ArefCreateOp op) {
   SetVector<int> consumerGroups;
 
   for (auto user : op->getUsers()) {
-    if (isa<ArefDestroyOp>(user))
-      continue;
     auto [wgOp, idx] = getWarpGroupIdx(user);
     auto numWarps = wgOp.getNumWarps()[idx];
 
@@ -170,33 +169,17 @@ BarrierCount getArrivalCount(ArefCreateOp op) {
 ArefValue createAndInitMbar(ArefCreateOp op, PatternRewriter &rewriter) {
   BarrierCount count = getArrivalCount(op);
 
-  MLIRContext *ctx = op.getContext();
-  auto loc = op.getLoc();
   auto arefTy = op.getType();
-  auto baseType = arefTy.getBaseType();
   auto arefBufTypes = llvm::to_vector(llvm::map_range(
       arefTy.getBaseType(), [](Type type) { return cast<MemDescType>(type); }));
   auto shape = arefBufTypes[0].getShape();
   auto depth = shape[0];
 
-  ImplicitLocOpBuilder builder(op.getLoc(), rewriter);
-  auto emptyMbars = createScalarAlloc(builder, rewriter.getI64Type(), depth);
-  auto fullMbars = createScalarAlloc(builder, rewriter.getI64Type(), depth);
-  auto lb = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
-  auto ub = rewriter.create<arith::ConstantIntOp>(loc, depth, 32);
-  auto step = rewriter.create<arith::ConstantIntOp>(loc, 1, 32);
-  auto dLoop = rewriter.create<scf::ForOp>(loc, lb, ub, step);
-  rewriter.setInsertionPointToStart(dLoop.getBody());
-
-  for (int i = 0; i < 2; ++i) {
-    bool isProducer = i == 0;
-    auto mbars = isProducer ? emptyMbars : fullMbars;
-    auto singleBarrier =
-        createSingleBufferView(rewriter, mbars, dLoop.getInductionVar());
-    int pendingCount =
-        isProducer ? count.producerPendingCount : count.consumerPendingCount;
-    rewriter.create<InitBarrierOp>(loc, singleBarrier, pendingCount);
-  }
+  auto wgOp = getWarpGroupIdx(*op->getUsers().begin()).first;
+  auto emptyMbars =
+      triton::createBarrierAlloc(wgOp, depth, count.producerPendingCount);
+  auto fullMbars =
+      triton::createBarrierAlloc(wgOp, depth, count.consumerPendingCount);
 
   return ArefValue{emptyMbars, fullMbars, static_cast<int>(depth),
                    op.getOperands()};
@@ -227,34 +210,29 @@ void lowerAsyncLoads(ArefPutEnterOp op, PatternRewriter &rewriter,
   auto loc = op.getLoc();
   // for now handle TMA loads in PutEnterOp
   SmallVector<Operation *> loadOps;
-  for (auto result : op.getResults())
+  for (auto result : op.getResults()) {
     for (auto user : result.getUsers()) {
       // Temporary workaround for lit testing: handle TMA loads here until a
       // dedicated tma_load op is added to the NVWS dialect
       if (user->getName().getStringRef() == "tma_load")
         loadOps.push_back(user);
     }
+  }
   assert(loadOps.size() <= op.getResults().size());
   if (loadOps.empty())
     return;
 
-  // matching ArefPutExitOp is with ArefPutEnterOp
-  // we use aref_tag to match the two
-  //   %bufs:n = aref_put.enter %aref[%enter_idx] {aref_tag = tag}
+  // Use the token to find the matching enter / exit pair
+  //   %bufs:n, %token = aref_put.enter %aref[%enter_idx]
   //   tma_load %bufs[0]
   //   ..
   //   tma_load %bufs[n-1]
-  //   aref_put.exit %aref[%exit_idx] {aref_tag = tag}
-
-  // locate the matching aref_put.exit with the same tag, to get full barrier
+  //   aref_put.exit %aref[%exit_idx], %token
   ArefPutExitOp arefPutExitOp;
-  auto arefTag = op->getAttrOfType<StringAttr>("aref_tag").str();
-  for (auto user : op.getAref().getUsers()) {
+  for (auto user : op.getToken().getUsers()) {
     if (auto exitOp = dyn_cast<ArefPutExitOp>(user)) {
-      if (exitOp->getAttrOfType<StringAttr>("aref_tag").str() == arefTag) {
-        arefPutExitOp = exitOp;
-        break;
-      }
+      arefPutExitOp = exitOp;
+      break;
     }
   }
   assert(arefPutExitOp);
@@ -269,8 +247,8 @@ void lowerAsyncLoads(ArefPutEnterOp op, PatternRewriter &rewriter,
   return;
 }
 
-LogicalResult rewritePutEnterOp(ArefCreateOp arefOp, ArefPutEnterOp op,
-                                PatternRewriter &rewriter, ArefValue arefVal) {
+void rewritePutEnterOp(ArefCreateOp arefOp, ArefPutEnterOp op,
+                       PatternRewriter &rewriter, ArefValue arefVal) {
   auto loc = op.getLoc();
   rewriter.setInsertionPointAfter(op);
 
@@ -281,7 +259,7 @@ LogicalResult rewritePutEnterOp(ArefCreateOp arefOp, ArefPutEnterOp op,
       rewriter.create<WaitBarrierOp>(loc, emptyBarrier, op.getPhase());
   assignStageCluster(waitOp, getStageCluster(op), rewriter);
   auto views = getSubViews(arefVal, op.getStage(), loc, rewriter);
-  assert(views.size() == op.getResults().size());
+  assert(views.size() == op.getBuffers().size());
 
   // TMA load need special handling as it requires fullMbarrier that
   // we need to get from matching ArefPutExitOp
@@ -289,13 +267,11 @@ LogicalResult rewritePutEnterOp(ArefCreateOp arefOp, ArefPutEnterOp op,
 
   // replaces uses with views
   for (int i = 0; i < arefVal.buffers.size(); ++i)
-    op.getResult(i).replaceAllUsesWith(views[i]);
-
-  return success();
+    op.getBuffers()[i].replaceAllUsesWith(views[i]);
 }
 
-LogicalResult rewriteGetEnterOp(ArefCreateOp arefOp, ArefGetEnterOp op,
-                                PatternRewriter &rewriter, ArefValue arefVal) {
+void rewriteGetEnterOp(ArefCreateOp arefOp, ArefGetEnterOp op,
+                       PatternRewriter &rewriter, ArefValue arefVal) {
   auto loc = op.getLoc();
   rewriter.setInsertionPointAfter(op);
 
@@ -303,17 +279,15 @@ LogicalResult rewriteGetEnterOp(ArefCreateOp arefOp, ArefGetEnterOp op,
   auto waitOp = rewriter.create<WaitBarrierOp>(loc, fullBarrier, op.getPhase());
   assignStageCluster(waitOp, getStageCluster(op), rewriter);
   auto views = getSubViews(arefVal, op.getStage(), loc, rewriter);
-  assert(views.size() == op.getResults().size());
+  assert(views.size() == op.getBuffers().size());
 
   for (int i = 0; i < arefVal.buffers.size(); ++i)
-    op.getResult(i).replaceAllUsesWith(views[i]);
-
-  return success();
+    op.getBuffers()[i].replaceAllUsesWith(views[i]);
 }
 
-LogicalResult insertArriveBarrier(Location loc, ArrayAttr asyncOps,
-                                  PatternRewriter &rewriter, Value mbar,
-                                  StageCluster stageCluster) {
+void insertArriveBarrier(Location loc, ArrayAttr asyncOps,
+                         PatternRewriter &rewriter, Value mbar,
+                         StageCluster stageCluster) {
   for (auto asyncOp : asyncOps) {
     auto asyncOpEnum = cast<AsyncOpAttr>(asyncOp).getValue();
     Operation *arriveOp = {};
@@ -337,46 +311,24 @@ LogicalResult insertArriveBarrier(Location loc, ArrayAttr asyncOps,
     if (arriveOp)
       assignStageCluster(arriveOp, stageCluster, rewriter);
   }
-
-  return success();
 }
 
-LogicalResult rewritePutExitOp(ArefPutExitOp op, PatternRewriter &rewriter,
-                               ArefValue arefVal) {
+void rewritePutExitOp(ArefPutExitOp op, PatternRewriter &rewriter,
+                      ArefValue arefVal) {
   auto loc = op->getLoc();
   rewriter.setInsertionPointAfter(op);
   Value fullBarrier = getFullBarrier(rewriter, loc, arefVal, op.getStage());
-  return insertArriveBarrier(loc, op.getAsyncOps(), rewriter, fullBarrier,
-                             getStageCluster(op));
+  insertArriveBarrier(loc, op.getAsyncOps(), rewriter, fullBarrier,
+                      getStageCluster(op));
 }
 
-LogicalResult rewriteGetExitOp(ArefGetExitOp op, PatternRewriter &rewriter,
-                               ArefValue arefVal) {
+void rewriteGetExitOp(ArefGetExitOp op, PatternRewriter &rewriter,
+                      ArefValue arefVal) {
   auto loc = op->getLoc();
   rewriter.setInsertionPointAfter(op);
   Value emptyBarrier = getEmptyBarrier(rewriter, loc, arefVal, op.getStage());
-  return insertArriveBarrier(loc, op.getAsyncOps(), rewriter, emptyBarrier,
-                             getStageCluster(op));
-}
-
-LogicalResult rewriteArefDestroyOp(ArefDestroyOp op, PatternRewriter &rewriter,
-                                   ArefValue arefVal) {
-  auto loc = op->getLoc();
-
-  rewriter.setInsertionPointAfter(op);
-  auto lb = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
-  auto ub = rewriter.create<arith::ConstantIntOp>(loc, arefVal.depth, 32);
-  auto step = rewriter.create<arith::ConstantIntOp>(loc, 1, 32);
-  auto dLoop = rewriter.create<scf::ForOp>(loc, lb, ub, step);
-
-  rewriter.setInsertionPointToStart(dLoop.getBody());
-  auto emptyMbar = createSingleBufferView(rewriter, arefVal.emptyMbars,
-                                          dLoop.getInductionVar());
-  rewriter.create<InvalBarrierOp>(loc, emptyMbar);
-  auto fullMbar = createSingleBufferView(rewriter, arefVal.fullMbars,
-                                         dLoop.getInductionVar());
-  rewriter.create<InvalBarrierOp>(loc, fullMbar);
-  return success();
+  insertArriveBarrier(loc, op.getAsyncOps(), rewriter, emptyBarrier,
+                      getStageCluster(op));
 }
 
 class LowerArefCreate : public OpRewritePattern<ArefCreateOp> {
@@ -386,36 +338,27 @@ public:
   LogicalResult matchAndRewrite(ArefCreateOp op,
                                 PatternRewriter &rewriter) const override {
     auto aref = createAndInitMbar(op, rewriter);
-    llvm::SmallSetVector<Operation *, 10> opToDelete;
+    SetVector<Operation *> opToDelete;
     opToDelete.insert(op.getOperation());
     for (auto userOp : op->getUsers()) {
+      opToDelete.insert(userOp);
       if (auto user = dyn_cast<ArefPutEnterOp>(userOp)) {
-        opToDelete.insert(user);
-        if (rewritePutEnterOp(op, user, rewriter, aref).failed())
-          return failure();
+        rewritePutEnterOp(op, user, rewriter, aref);
       } else if (auto user = dyn_cast<ArefGetEnterOp>(userOp)) {
-        opToDelete.insert(user);
-        if (rewriteGetEnterOp(op, user, rewriter, aref).failed())
-          return failure();
+        rewriteGetEnterOp(op, user, rewriter, aref);
       } else if (auto user = dyn_cast<ArefPutExitOp>(userOp)) {
-        opToDelete.insert(user);
-        if (rewritePutExitOp(user, rewriter, aref).failed())
-          return failure();
+        rewritePutExitOp(user, rewriter, aref);
       } else if (auto user = dyn_cast<ArefGetExitOp>(userOp)) {
-        opToDelete.insert(user);
-        if (rewriteGetExitOp(user, rewriter, aref).failed())
-          return failure();
-      } else if (auto user = dyn_cast<ArefDestroyOp>(userOp)) {
-        opToDelete.insert(user);
-        if (rewriteArefDestroyOp(user, rewriter, aref).failed())
-          return failure();
+        rewriteGetExitOp(user, rewriter, aref);
       } else {
         llvm_unreachable("users of aref can only be ArefPut or ArefGet");
       }
     }
 
-    for (auto it = opToDelete.rbegin(); it != opToDelete.rend(); ++it)
+    auto sorted = topologicalSort(opToDelete);
+    for (auto it = sorted.rbegin(); it != sorted.rend(); ++it) {
       rewriter.eraseOp(*it);
+    }
 
     return success();
   }
