@@ -18,8 +18,8 @@ class OptFlags:
     xcd_swizzle: int
     w_cache_modifier: str
     split_k: int
-    fused_scatter: bool
     is_persistent: bool
+    fused_scatter: bool
     idle_sms: int
     epilogue_subtile: int | None
     arch: str
@@ -30,12 +30,12 @@ class OptFlags:
             raise ValueError("Not supported")
 
 
-
 def make_default_opt_flags_amd(
     out_dtype,
     lhs_dtype,
     rhs_dtype,
     precision_config,
+    batch_size,
     m,
     n,
     k,
@@ -118,8 +118,8 @@ def make_default_opt_flags_amd(
         xcd_swizzle=xcd_swizzle,
         w_cache_modifier=w_cache_modifier,
         split_k=split_k,
-        fused_scatter=constraints.get('fused_scatter', False),
         is_persistent=is_persistent,
+        fused_scatter=constraints.get('fused_scatter', False),
         idle_sms=0,
         epilogue_subtile=epilogue_subtile,
         arch=None,
@@ -134,6 +134,7 @@ def make_default_opt_flags_nvidia(
     lhs_dtype,
     rhs_dtype,
     precision_config,
+    batch_size,
     m,
     n,
     k,
@@ -144,10 +145,10 @@ def make_default_opt_flags_nvidia(
     epilogue_effective_itemsize,
     constraints,
 ):
-    constraints_supported = ["block_m", "block_k", "split_k", "fused_scatter", "is_persistent", "epilogue_subtile", "num_stages", "idle_sms"]
+    constraints_supported = ["block_m", "block_k", "split_k", "is_persistent", "fused_scatter", "epilogue_subtile", "num_stages", "idle_sms"]
     assert not any([c not in constraints_supported for c in constraints]), constraints.keys()
     # tokens per expert
-    if routing_data is None:
+    if routing_data is None or batch_size > 1:
         tokens_per_expt = m
     elif routing_data.expected_tokens_per_expt is None:
         tokens_per_expt = max(1, m // routing_data.n_expts_tot)
@@ -165,11 +166,11 @@ def make_default_opt_flags_nvidia(
         block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
     # block n
     arch = None
-    block_n = opt_flags_nvidia.compute_block_n(n, arch, precision_config)
+    block_n, block_n_tma = opt_flags_nvidia.compute_block_n(n, arch, precision_config)
     # is_persistent
-    grid_size = opt_flags_nvidia.compute_grid_size(routing_data, m, n, block_m, block_n)
+    grid_size_tma = opt_flags_nvidia.compute_grid_size(routing_data, batch_size, m, n, block_m, block_n_tma)
     n_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    tiles_per_sm = grid_size / n_sms
+    tiles_per_sm = grid_size_tma / n_sms
     supports_persistent = can_use_persistent_tma and (arch is None or int(arch[2:-1]) >= 9)
     if constraints.get("is_persistent", None) is not None:
         is_persistent = constraints["is_persistent"]
@@ -179,6 +180,10 @@ def make_default_opt_flags_nvidia(
         # TEMP CHANGE
         if precision_config.act_scale is not None or precision_config.out_scale is not None:
             is_persistent = False
+        # TMA is slower for batched matmuls with small m/n/k.
+        if m * n * k < 131072:
+            is_persistent = False
+    block_n = block_n_tma if is_persistent else block_n
     # block k
     if constraints.get("block_k", None) is not None:
         block_k = constraints["block_k"]
@@ -190,7 +195,7 @@ def make_default_opt_flags_nvidia(
     elif is_persistent or enforce_bitwise_invariance or precision_config.act_scale is not None or precision_config.out_scale is not None:
         split_k = 1
     else:
-        estimated_actual_grid_size = opt_flags_nvidia.compute_grid_size(None, m, n, block_m, block_n)
+        estimated_actual_grid_size = opt_flags_nvidia.compute_grid_size(None, batch_size, m, n, block_m, block_n)
         split_k = opt_flags_nvidia.compute_split_k(block_k, k, estimated_actual_grid_size)
     if split_k > 1:
         # With split_k, results are written in f32. Use that for the following computations.
@@ -198,6 +203,7 @@ def make_default_opt_flags_nvidia(
     compute_num_stages_args = (
         precision_config,
         is_persistent,
+
         block_m,
         block_n,
         block_k,
@@ -218,25 +224,24 @@ def make_default_opt_flags_nvidia(
     assert num_stages >= 1
     if constraints.get("num_stages", None):
         num_stages = constraints["num_stages"]
-
     # fused scatter scratchpad
     if constraints.get("fused_scatter", None) is not None:
         fused_scatter = constraints["fused_scatter"]
     else:
         fused_scatter = can_use_fused_scatter and split_k == 1
     # Handshake with the HBM swizzling
-    num_warps = opt_flags_nvidia.compute_num_warps(block_m, block_n, precision_config)
+    num_warps = opt_flags_nvidia.compute_num_warps(block_m, block_n, is_persistent, precision_config)
     ret = OptFlags(
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
         num_warps=num_warps,
         num_stages=num_stages,
+        fused_scatter=fused_scatter,
         group_m=group_m,
         xcd_swizzle=xcd_swizzle,
         w_cache_modifier=None,
         split_k=split_k,
-        fused_scatter=fused_scatter,
         is_persistent=is_persistent,
         epilogue_subtile=epilogue_subtile,
         arch=arch,
@@ -276,6 +281,7 @@ def make_opt_flags(
     lhs_dtype,
     rhs_dtype,
     precision_config,
+    batch_size,
     m,
     n,
     k,
@@ -286,11 +292,13 @@ def make_opt_flags(
 ):
     if _opt_flags_constraints.get("is_persistent", False) and not can_use_persistent_tma:
         raise InapplicableConstraint("cannot enforce `is_persistent=True` constraint")
+    if _opt_flags_constraints.get("fused_scatter", False) and not can_use_fused_scatter:
+        raise InapplicableConstraint("cannot enforce `fused_scatter=True` constraint")
     enforce_bitwise_invariance = precision_config.enforce_bitwise_invariance
     if _opt_flags is not None:
         assert not _opt_flags_constraints
         return _opt_flags
-    args = [out_dtype, lhs_dtype, rhs_dtype, precision_config, m, n, k,
+    args = [out_dtype, lhs_dtype, rhs_dtype, precision_config, batch_size, m, n, k,
             routing_data, can_use_persistent_tma, can_use_fused_scatter,
             enforce_bitwise_invariance, epilogue_effective_itemsize,
             _opt_flags_constraints]
