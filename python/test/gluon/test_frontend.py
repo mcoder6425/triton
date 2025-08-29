@@ -77,6 +77,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 @filecheck_test
 @gluon.jit
+def test_histogram_frontend():
+    # CHECK: #blocked = #ttg.blocked
+    # CHECK-LABEL: test_histogram_frontend
+    layout: ttgl.constexpr = ttgl.BlockedLayout([1], [32], [4], [0])
+    x = ttgl.arange(0, 256, layout=layout)
+    m = x < 128
+    # CHECK: tt.histogram %{{.*}}, %{{.*}} : tensor<256xi32, #blocked> -> tensor<512xi32, #blocked>
+    _ = ttgl.histogram(x, 512, mask=m, layout=layout)
+
+
+@filecheck_test
+@gluon.jit
 def test_convert_layout_assert_trivial():
     # CHECK: test_convert_layout_assert_trivial
     parent_layout: ttgl.constexpr = ttgl.BlockedLayout([1, 128], [32, 1], [4, 1], [0, 1])
@@ -798,6 +810,24 @@ def test_mlir_attr_error():
     assert "order must be a permutation of 0..(rank-1), but was [1]" in str(e.value.__cause__)
 
 
+def test_tensor_layout_type_changed():
+
+    @gluon.jit
+    def kernel():
+        layout: ttgl.constexpr = ttgl.BlockedLayout(size_per_thread=[1, 1], threads_per_warp=[1, 32],
+                                                    warps_per_cta=[1, 4], order=[1, 0])
+        x = ttgl.zeros([128], ttgl.float32)
+        y = ttgl.zeros([128, 128], ttgl.float32, layout=layout)
+        c = ttgl.to_tensor(True)
+        while c:
+            x = x + y.sum(axis=0)
+
+    with pytest.raises(CompilationError) as e:
+        run_parser(kernel)
+
+    assert "Loop-carried variable x has initial type" in str(e.value)
+
+
 @gluon.jit
 def tmem_index_kernel():
     layout: ttgl.constexpr = TensorMemoryLayout(block=[128, 128], unpacked=True)
@@ -1330,6 +1360,36 @@ def test_inline_asm_elementwise():
     x = ttgl.arange(0, 16, layout)
     # CHECK: elementwise_inline_asm {{.*}} : tensor<16xi32, [[BLOCKED:#.*]]> -> tensor<16xi32, [[BLOCKED]]>
     ttgl.inline_asm_elementwise("mov $0, $0;", "=r,r", [x], dtype=x.dtype, is_pure=True, pack=1)
+
+
+@gluon.jit
+def load_kernel(inp, xnumel):
+    block_layout: ttgl.constexpr = ttgl.BlockedLayout([1], [32], [4], [0])
+    xindex = ttgl.arange(0, 128, block_layout)
+    mask = xindex < xnumel
+    ttgl.load(inp + xindex, mask=mask, other=0.0)
+
+
+@pytest.mark.parametrize("target", ALL_TARGETS)
+def test_load(target):
+    mod = run_parser(load_kernel, *make_args(MockTensor(ttgl.float32), xnumel=100), target=target)
+    expecttest.assert_expected_inline(
+        anonymize_ir(mod.str_nodebug()), """\
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "...", "ttg.threads-per-warp" = 32 : i32} {
+  tt.func public @load_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: i32) attributes {noinline = false} {
+    %0 = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked>
+    %1 = tt.splat %arg1 : i32 -> tensor<128xi32, #blocked>
+    %2 = arith.cmpi slt, %0, %1 : tensor<128xi32, #blocked>
+    %3 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>, #blocked>
+    %4 = tt.addptr %3, %0 : tensor<128x!tt.ptr<f32>, #blocked>, tensor<128xi32, #blocked>
+    %cst = arith.constant 0.000000e+00 : f32
+    %cst_0 = arith.constant dense<0.000000e+00> : tensor<128xf32, #blocked>
+    %5 = tt.load %4, %2, %cst_0 : tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+""")
 
 
 @gluon.jit
@@ -2209,3 +2269,11 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   }
 }
 """)
+
+
+@filecheck_test
+@gluon.jit
+def test_layout_zeros():
+    # CHECK: #blocked = #ttg.blocked
+    # CHECK: arith.constant dense<0.000000e+00> : tensor<128xf32, #blocked>
+    ttgl.zeros([128], ttgl.float32, layout=ttgl.BlockedLayout([1], [32], [4], [0]))

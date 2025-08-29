@@ -4,6 +4,7 @@ import copy
 import hashlib
 import inspect
 import itertools
+import threading
 import re
 import textwrap
 from collections import defaultdict
@@ -379,8 +380,6 @@ def create_specialize_impl(specialize_extra):
             return ("constexpr", arg.cache_key)
         elif isinstance(arg, constexpr):
             return ("constexpr", arg)
-        elif hasattr(arg, "tma_desc_cpu_ptr"):
-            return ("nvTmaDesc", None)
         elif isinstance(arg, tuple):
             spec = [specialize_impl(x) for x in arg]
             make_tuple = lambda vals: type(arg)(*vals) if hasattr(arg, "_fields") else tuple(vals)
@@ -500,8 +499,12 @@ class JITCallable:
     def __init__(self, fn):
         self.fn = fn
         self.signature = inspect.signature(fn)
-        self.raw_src, self.starting_line_number = inspect.getsourcelines(fn)
+        try:
+            self.raw_src, self.starting_line_number = inspect.getsourcelines(fn)
+        except OSError as e:
+            raise ValueError("@jit functions should be defined in a Python file") from e
         self._fn_name = get_full_name(fn)
+        self._hash_lock = threading.RLock()
 
         # function source code (without decorators)
         src = textwrap.dedent("".join(self.raw_src))
@@ -533,7 +536,9 @@ class JITCallable:
     @property
     def cache_key(self):
         # TODO : hash should be attribute of `self`
-        if self.hash is None:
+        with self._hash_lock:
+            if self.hash is not None:
+                return self.hash
             # Set a placeholder hash to break recursion in case the function
             # transitively calls itself. The full hash is set after.
             self.hash = f"recursion:{self._fn_name}"
@@ -595,7 +600,7 @@ class JitFunctionInfo:
 
 
 def compute_cache_key(kernel_key_cache, specialization, options):
-    key = (tuple(specialization), tuple(options.items()))
+    key = (tuple(specialization), str(options))
     cache_key = kernel_key_cache.get(key, None)
     if cache_key is not None:
         return cache_key
@@ -764,10 +769,8 @@ class JITFunction(JITCallable, KernelInterface[T]):
         super().__init__(fn)
         self.module = fn.__module__
         self.version = version
-        self.signature = inspect.signature(fn)
         self.do_not_specialize = do_not_specialize
         self.do_not_specialize_on_alignment = do_not_specialize_on_alignment
-        self.raw_src, self.starting_line_number = inspect.getsourcelines(fn)
         self._repr = repr
         self.launch_metadata = launch_metadata
 
