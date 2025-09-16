@@ -9,8 +9,10 @@
 #include "triton/Dialect/Gluon/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 
@@ -332,6 +334,14 @@ void init_gluon_ir(py::module &&m) {
                                         /*requiresSurjective=*/true);
              return ttg::LinearEncodingAttr::get(ctx, ll);
            })
+      .def("to_linear_layout",
+           [](GluonOpBuilder &self, Attribute layout,
+              std::vector<int64_t> &shape) -> py::object {
+             auto ctx = self.getContext();
+             auto linearLayout = ttg::toLinearLayout(shape, layout);
+             auto attr = ttg::LinearEncodingAttr::get(ctx, linearLayout);
+             return layoutToGluon(attr);
+           })
       .def("get_dot_operand_layout",
            [](GluonOpBuilder &self, unsigned opIdx, Attribute parent,
               unsigned kWidth) -> Attribute {
@@ -395,6 +405,20 @@ void init_gluon_ir(py::module &&m) {
              return ttg::PaddedSharedEncodingAttr::get(ctx, intervals, paddings,
                                                        ll);
            })
+      .def("get_shared_linear_layout",
+           [](GluonOpBuilder &self, std::vector<std::vector<int>> &offsetBases,
+              std::vector<std::vector<int>> &blockBases,
+              std::vector<int64_t> &shape, unsigned alignment) -> Attribute {
+             auto ctx = self.getContext();
+             auto kOffset = mlir::StringAttr::get(ctx, "offset");
+             auto kBlock = mlir::StringAttr::get(ctx, "block");
+             auto ll = tt::LinearLayout(
+                 {{kOffset, offsetBases}, {kBlock, blockBases}},
+                 tt::standardOutDimPairs(ctx, shape),
+                 /*requireSurjective=*/true);
+             return self.getChecked<ttg::SharedLinearEncodingAttr>(ctx, ll,
+                                                                   alignment);
+           })
       .def("get_nvmma_shared_layout",
            [](GluonOpBuilder &self, unsigned swizzleByteWidth,
               unsigned elementBitwidth, bool transposed, bool fp4Padded,
@@ -424,13 +448,14 @@ void init_gluon_ir(py::module &&m) {
                  ctx, vec, perPhase, maxPhase, order, ctaLayout);
            })
       .def("get_tensor_memory_layout",
-           [](GluonOpBuilder &self, std::vector<unsigned> &block, bool unpacked,
+           [](GluonOpBuilder &self, std::vector<unsigned> &block,
+              unsigned colStride,
               std::vector<unsigned> &ctaSplitNum) -> Attribute {
              auto ctx = self.getContext();
              assert(block.size() == 2);
              assert(ctaSplitNum.size() == 2);
              return self.getChecked<ttng::TensorMemoryEncodingAttr>(
-                 ctx, block[0], block[1], unpacked, ctaSplitNum[0],
+                 ctx, block[0], block[1], colStride, ctaSplitNum[0],
                  ctaSplitNum[1]);
            })
       .def("get_tensor_memory_scales_layout",
@@ -522,6 +547,15 @@ void init_gluon_ir(py::module &&m) {
       .def("create_local_load",
            [](GluonOpBuilder &self, Type resultTy, Value memDesc) -> Value {
              return self.create<ttg::LocalLoadOp>(resultTy, memDesc);
+           })
+      .def("get_shared_bank_conflicts",
+           [](GluonOpBuilder &self, Attribute regLayoutAttr,
+              Attribute sharedLayoutAttr, std::vector<int64_t> &shape,
+              int bitwidth) -> int {
+             auto regLayout = ttg::toLinearLayout(shape, regLayoutAttr);
+             auto smemLayout = ttg::toLinearLayout(shape, sharedLayoutAttr);
+             return 1 << ttg::logBankConflictsMemDesc(regLayout, smemLayout,
+                                                      bitwidth);
            })
       .def("create_local_dealloc",
            [](GluonOpBuilder &self, Value memDesc) -> Operation * {
