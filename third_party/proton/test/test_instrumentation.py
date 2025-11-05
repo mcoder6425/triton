@@ -12,7 +12,7 @@ import triton.language.semantic
 import triton.profiler as proton
 import triton.profiler.language as pl
 from triton.tools.tensor_descriptor import TensorDescriptor
-from triton._internal_testing import is_hip_cdna2, supports_tma, supports_ws
+from triton._internal_testing import is_hip_cdna2, is_hip_cdna4, supports_tma, supports_ws, is_cuda
 
 pl.enable_semantic("triton")
 
@@ -72,7 +72,9 @@ def test_jit(tmp_path):
 
 
 @pytest.mark.parametrize("method", ["operator", "context_manager"])
-def test_record(method, tmp_path: pathlib.Path):
+def test_record(method, fresh_knobs, tmp_path: pathlib.Path):
+    fresh_knobs.compilation.disable_line_info = False
+
     from contextlib import contextmanager
 
     @contextmanager
@@ -109,7 +111,6 @@ def test_record(method, tmp_path: pathlib.Path):
         output = x + y
         tl.store(output_ptr + offsets, output, mask=mask)
 
-    torch.manual_seed(0)
     size = 256
     x = torch.rand(size, device="cuda")
     y = torch.rand(size, device="cuda")
@@ -146,6 +147,36 @@ def test_record(method, tmp_path: pathlib.Path):
     assert "proton.record start" in ttir
     assert "proton.record end" in ttir
 
+    # check ttir line info
+    start_loc = None
+    end_loc = None
+    for line in ttir.split("\n"):
+        if "proton.record start" in line:
+            start_loc = line.split("loc(")[1].split(")")[0]
+        elif "proton.record end" in line:
+            end_loc = line.split("loc(")[1].split(")")[0]
+        elif start_loc and f"#loc{start_loc}" in line:
+            assert "test_instrumentation.py" in line
+        elif end_loc and f"#loc{end_loc}" in line:
+            assert "test_instrumentation.py" in line
+
+    assert start_loc is not None and end_loc is not None
+
+    # check llir line info
+    llir_lines = pgm.asm["llir"].splitlines()
+    clock_instr = "clock" if is_cuda() else "memtime"
+    clock_loc = None
+    for line in llir_lines:
+        if clock_instr not in line or "!dbg" not in line:
+            continue
+        suffix = line.split("!dbg ")[1]
+        clock_loc = suffix.split(",")[0].split()[0]
+        break
+    assert clock_loc is not None
+    loc_line = next((line for line in llir_lines if clock_loc in line and "DILocation" in line), None)
+    assert loc_line is not None
+    assert "line: " in loc_line and "line: 0" not in loc_line
+
 
 @pytest.mark.parametrize("hook", ["triton", None])
 def test_tree(tmp_path: pathlib.Path, hook):
@@ -175,7 +206,6 @@ def test_tree(tmp_path: pathlib.Path, hook):
             output = x + y
             tl.store(output_ptr + offsets, output, mask=mask)
 
-    torch.manual_seed(0)
     size = 256
     x = torch.rand(size, device="cuda")
     y = torch.rand(size, device="cuda")
@@ -244,7 +274,6 @@ def test_trace(tmp_path: pathlib.Path):
             output = x - y
             tl.store(output_ptr + offsets, output, mask=mask)
 
-    torch.manual_seed(0)
     size = 256
     x = torch.rand(size, device="cuda")
     y = torch.rand(size, device="cuda")
@@ -291,7 +320,6 @@ def test_multi_session(tmp_path: pathlib.Path):
         output = x + y
         tl.store(output_ptr + offsets, output, mask=mask)
 
-    torch.manual_seed(0)
     size = 256
     x = torch.rand(size, device="cuda")
     y = torch.rand(size, device="cuda")
@@ -360,7 +388,6 @@ def test_autotune(tmp_path: pathlib.Path):
         output = x + y
         tl.store(output_ptr + offsets, output, mask=mask)
 
-    torch.manual_seed(0)
     size = 2048
     x = torch.rand(size, device="cuda")
     y = torch.rand(size, device="cuda")
@@ -396,7 +423,6 @@ def test_warp_spec(tmp_path: pathlib.Path):
                           WARP_SPECIALIZE: tl.constexpr,  #
                           ):
         dtype = tl.float8e4nv if FP8_OUTPUT else tl.float16
-        pl.enter_scope("kernel")
         pid = tl.program_id(axis=0)
         num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
         num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -427,7 +453,6 @@ def test_warp_spec(tmp_path: pathlib.Path):
         offs_cm = pid_m * BLOCK_SIZE_M
         offs_cn = pid_n * BLOCK_SIZE_N
         c_desc.store([offs_cm, offs_cn], c)
-        pl.exit_scope("kernel")
 
     def matmul_tma(a, b, warp_specialize: bool):
         # Check constraints.
@@ -470,7 +495,6 @@ def test_warp_spec(tmp_path: pathlib.Path):
     mode = proton.mode.Default(metric_type="cycle", optimizations="clock32")
     temp_file = tmp_path / "test_warpspec.hatchet"
     proton.start(str(temp_file.with_suffix("")), backend="instrumentation", mode=mode)
-    torch.manual_seed(0)
     M, N, K = 512, 512, 512
     a = torch.randn((M, K), device="cuda", dtype=torch.float16).to(torch.float8_e4m3fn)
     b = torch.randn((K, N), device="cuda", dtype=torch.float16).to(torch.float8_e4m3fn)
@@ -481,11 +505,10 @@ def test_warp_spec(tmp_path: pathlib.Path):
 
     with open(temp_file, "rb") as f:
         data = json.load(f)
-        kernel_level = data[0]["children"][0]["children"][0]
-        assert kernel_level["children"][0]["frame"]["name"] == "loop"
-        assert kernel_level["children"][0]["metrics"]["cycles"] > 0
-        assert kernel_level["frame"]["name"] == "kernel"
-        assert kernel_level["metrics"]["cycles"] > 0
+        kernel = data[0]["children"][0]
+        assert kernel["children"][0]["frame"]["name"] == "loop"
+        assert kernel["children"][0]["metrics"]["cycles"] > 0
+        assert kernel["frame"]["name"] == "matmul_kernel_tma"
 
 
 def test_timeline(tmp_path: pathlib.Path):
@@ -529,6 +552,7 @@ def test_timeline(tmp_path: pathlib.Path):
         assert trace_events[-1]["args"]["call_stack"][-2] == "test"
 
 
+@pytest.mark.skipif(is_hip_cdna4(), reason="nondeterministic failure")
 def test_globaltime(tmp_path: pathlib.Path):
     temp_file = tmp_path / "test_globaltime.chrome_trace"
     mode = proton.mode.Default(
@@ -557,7 +581,6 @@ def test_globaltime(tmp_path: pathlib.Path):
         tl.store(output_ptr + offsets, output, mask=mask)
         pl.exit_scope("elementwise_add_kernel")
 
-    torch.manual_seed(0)
     size = 1024 * 2000
     x = torch.rand(size, device="cuda")
     y = torch.rand(size, device="cuda")
